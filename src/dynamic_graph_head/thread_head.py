@@ -19,15 +19,22 @@ import signal
 import sys
 from kyber_utils.exception import ExceptionStackInspector
 from kyber_utils.os import _rt_enabled, apply_realtime_priority, sleep_until
+from kyber_utils.watchdog import Watchdog
 
 import matplotlib.pylab as plt
 
 class ThreadHead(threading.Thread):
-    def __init__(self, dt, safety_controllers, heads, utils, env=None):
+    def __init__(self, dt, safety_controllers, heads, utils, env=None, step_timeout_s=0.1):
         threading.Thread.__init__(self)
 
         self.dt = dt
         self.env = env
+
+        # Watchdog: if a single main-loop tick blocks longer than step_timeout_s,
+        # WatchdogTimeout is raised in the thread-head thread so the loop can't
+        # hang silently. Set to None to disable.
+        self.step_timeout_s = step_timeout_s
+        self._watchdog = Watchdog(step_timeout_s)
 
         if type(heads) != dict:
             self.head = heads # Simple-edge-case for single head setup.
@@ -444,6 +451,7 @@ class ThreadHead(threading.Thread):
         self.stop_logging()
         self.stop_streaming()
         self.run_loop = False
+        self._watchdog.stop()
 
     def start(self):
         # Put the safety controller as active controller. Doing this here
@@ -463,11 +471,22 @@ class ThreadHead(threading.Thread):
         next_time = time.clock_gettime(time.CLOCK_MONOTONIC)
         max_lag = 1.5 * self.dt
 
+        # The very first tick may block on system startup (hardware coming up,
+        # lazy imports, first logging setup, ...) -> give it a larger budget.
+        warmup_timeout_s = 2.0
+        warmup_rounds = 10
+
         try:
             while self.run_loop:
                 sleep_until(next_time)
 
-                self.run_main_loop()
+                with self._watchdog.guard(timeout_s=warmup_timeout_s):
+                    self.run_main_loop()
+
+                if warmup_rounds == 0:
+                    first_tick_timeout_s = None  # later ticks use the default timeout
+                else:
+                    warmup_rounds -= 1
 
                 next_time += self.dt
 
