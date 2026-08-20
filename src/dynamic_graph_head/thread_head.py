@@ -18,7 +18,7 @@ import threading
 import signal
 import sys
 from kyber_utils.exception import ExceptionStackInspector
-from kyber_utils.os import _rt_enabled, apply_realtime_priority, sleep_until
+from kyber_utils.os import _rt_enabled, apply_realtime_priority, set_timer_slack, sleep_until
 from kyber_utils.watchdog import Watchdog
 
 import matplotlib.pylab as plt
@@ -466,6 +466,12 @@ class ThreadHead(threading.Thread):
         """ Use this method to start running the main loop in a thread. """
         if _rt_enabled:
             apply_realtime_priority()
+
+        # Without this the kernel is free to fire our wakeup up to 50us late
+        # (the default timer slack), i.e. 5% of a 1 kHz period landing
+        # straight in sleep_until()'s jitter. Redundant once SCHED_FIFO is in
+        # effect, which already runs with zero slack.
+        set_timer_slack()
 
         self.run_loop = True
         next_time = time.clock_gettime(time.CLOCK_MONOTONIC)
