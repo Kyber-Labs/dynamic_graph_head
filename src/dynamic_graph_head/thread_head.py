@@ -18,7 +18,8 @@ import threading
 import signal
 import sys
 from kyber_utils.exception import ExceptionStackInspector
-from kyber_utils.os import _rt_enabled, apply_realtime_priority, set_timer_slack, sleep_until
+import kyber_utils.os as _kos
+from kyber_utils.os import apply_realtime_priority, set_timer_slack, sleep_until, spread_threads
 from kyber_utils.watchdog import Watchdog
 
 import matplotlib.pylab as plt
@@ -58,6 +59,11 @@ class ThreadHead(threading.Thread):
         self.absolute_time  = 0.
         self.time_start_recording = 0.
         self.is_paused = False
+
+        # GIL switch interval while a tick runs / while sleeping (see run()).
+        # Set either to None to leave sys.setswitchinterval() alone.
+        self.gil_tick_interval_s = 0.05
+        self.gil_sleep_interval_s = 0.0005
 
         self.running_controller = False
         self.last_exception = None
@@ -464,8 +470,17 @@ class ThreadHead(threading.Thread):
 
     def run(self):
         """ Use this method to start running the main loop in a thread. """
-        if _rt_enabled:
+        # Read the flag live: `from kyber_utils.os import _rt_enabled` would
+        # copy its value at import time, and notebooks import ThreadHead
+        # before they call set_realtime_priority().
+        if _kos._rt_enabled:
             apply_realtime_priority()
+            # Keep this thread alone on one CPU and spread every other thread
+            # of the process over the remaining allowed CPUs. Under isolcpus
+            # the kernel never migrates threads, so without this all helper
+            # threads pile onto one core and a descheduled GIL/lock holder
+            # stalls the control loop (see kyber_utils.os.ThreadSpreader).
+            spread_threads()
 
         # Without this the kernel is free to fire our wakeup up to 50us late
         # (the default timer slack), i.e. 5% of a 1 kHz period landing
@@ -477,6 +492,21 @@ class ThreadHead(threading.Thread):
         next_time = time.clock_gettime(time.CLOCK_MONOTONIC)
         max_lag = 1.5 * self.dt
 
+        # GIL hand-off policy (process-global knob, toggled per tick):
+        #  - while the tick runs, a long switch interval means no other thread
+        #    can force this thread to drop the GIL mid-tick (a forced hand-off
+        #    costs the tick a wait for whoever grabbed it). 50 ms (not
+        #    "infinite") so a runaway tick can still be interrupted by the
+        #    watchdog / KeyboardInterrupt, which need the GIL.
+        #  - while sleeping, a short interval means that when we wake up, a
+        #    Python-bytecode GIL holder is forced to yield within that time.
+        # A holder inside a long C call is unaffected either way.
+        gil_tick_s = self.gil_tick_interval_s
+        gil_sleep_s = self.gil_sleep_interval_s
+        gil_policy = gil_tick_s is not None and gil_sleep_s is not None
+        if gil_policy:
+            self._gil_interval_before = sys.getswitchinterval()
+
         # The very first tick may block on system startup (hardware coming up,
         # lazy imports, first logging setup, ...) -> give it a larger budget.
         warmup_timeout_s = 2.0
@@ -484,7 +514,16 @@ class ThreadHead(threading.Thread):
 
         try:
             while self.run_loop:
+                # Re-read each tick so the policy can be toggled live
+                # (th.gil_tick_interval_s = None disables it).
+                gil_tick_s = self.gil_tick_interval_s
+                gil_sleep_s = self.gil_sleep_interval_s
+                gil_policy = gil_tick_s is not None and gil_sleep_s is not None
+                if gil_policy:
+                    sys.setswitchinterval(gil_sleep_s)
                 sleep_until(next_time)
+                if gil_policy:
+                    sys.setswitchinterval(gil_tick_s)
 
                 with self._watchdog.guard(timeout_s=warmup_timeout_s):
                     self.run_main_loop()
@@ -503,6 +542,9 @@ class ThreadHead(threading.Thread):
                         next_time += self.dt
         except BaseException as e:
             self.last_exception = ExceptionStackInspector()
+        finally:
+            if gil_policy:
+                sys.setswitchinterval(self._gil_interval_before)
 
 
     def run_blocking_head(self):
